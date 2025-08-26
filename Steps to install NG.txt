@@ -1,0 +1,52 @@
+STEP1- Download the latest EPOS software package from the link provided by Network
+STEP2- Place the downloaded folder (let’s say EPOSXX – XX is version number) inside hard disk.
+STEP3- Open command prompt and go to the EPOSXX/service location as mention below –
+ 
+ 
+STEP4- Install the NGPASS software by running ngpas_service_install.bat as mention below 
+ 
+ 
+ 
+Note: 
+1-	During install it will ask to allow app to make changes 6 times, Press YES button to allow for all the changes.
+2-	Message “The service NGPAS has been installed” should come.
+STEP6- Now type command ngpas_service_config.bat and press YES after that to allow changes 
+ 
+  
+After pressing YES, a new window will prompt as below. Follow below to enter parameter details in each Tab
+General 
+ 
+Log On  
+ 
+Logging
+ 
+Java
+On Java Virtual Machine option click on the 3 dots (…) and insert the location of JVM.dll of latest JAVA version installed.
+ 
+Startup
+ 
+Note: 
+•	In case of EPOS on serial mode: (AP10 device or AT150 device with USB cable):
+Remove the IP address and PORT (31000 & 310010) address and put only 8085 as below
+   
+•	In case of EPOS on Wi-Fi mode (AT150 device):  Just Remove the existing IP address and put IP address of PED device (Go to about option in POS for IP address).
+ 
+Shutdown
+ 
+ 
+Step 7:  Check and start the NGPASS service as below 
+ 
+ 
+ 
+Right click on NGPAS and start the service
+ 
+ 
+In case of windows 7 or less insert the IP address in hosts file present in “C:\Windows\System32\drivers\etc.” as below
+ 
+ 
+Steps 8: Check logs if device is communicating to POS device
+Open Power shell and go to EPOSXX\service\logs location 
+Type command gc .\ngpas-stdout.2019-05-19.log –wait 
+  
+ 
+Logs should show “USB Connection: COM8 – Connected”
