@@ -1,0 +1,28 @@
+# Build artifacts
+bin/
+obj/
+*.user
+*.suo
+*.cache
+*.log
+
+# Visual Studio temp files
+.vs/
+.vscode/
+
+# Test results
+TestResults/
+
+# NuGet packages
+packages/
+*.nupkg
+*.snupkg
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

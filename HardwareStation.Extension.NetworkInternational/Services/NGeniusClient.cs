@@ -12,6 +12,12 @@ namespace MAF.Commerce.HardwareStation.Extension.NGenius.Services
         private readonly int port;
         private TcpClient tcp;
         private NetworkStream stream;
+        
+        // Configuration for retry and backoff logic
+        private const int MaxRetryAttempts = 3;
+        private const int MaxConnectionRetryAttempts = 3;
+        private const int BaseBackoffDelayMs = 1000;
+        private const int MaxBackoffDelayMs = 30000;
 
         public NGeniusClient(string host, int port)
         {
@@ -23,12 +29,37 @@ namespace MAF.Commerce.HardwareStation.Extension.NGenius.Services
         {
             if (tcp != null && tcp.Connected) return;
 
-            tcp = new TcpClient();
-            tcp.Connect(host, port);
-            stream = tcp.GetStream();
+            for (int attempt = 1; attempt <= MaxConnectionRetryAttempts; attempt++)
+            {
+                try
+                {
+                    Disconnect(); // Ensure clean state
+                    
+                    tcp = new TcpClient();
+                    tcp.Connect(host, port);
+                    stream = tcp.GetStream();
 
-            // Initial handshake
-            Send("connect()");
+                    // Initial handshake
+                    Send("connect()");
+                    Log($"Successfully connected to PED at {host}:{port} (attempt {attempt})");
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Log($"Connection attempt {attempt} failed: {ex.Message}");
+                    
+                    if (attempt == MaxConnectionRetryAttempts)
+                    {
+                        Log($"Failed to connect to PED after {MaxConnectionRetryAttempts} attempts");
+                        throw new InvalidOperationException($"Unable to connect to PED at {host}:{port} after {MaxConnectionRetryAttempts} attempts", ex);
+                    }
+                    
+                    // Wait before retry with exponential backoff
+                    var delay = Math.Min(BaseBackoffDelayMs * (int)Math.Pow(2, attempt - 1), MaxBackoffDelayMs);
+                    Log($"Waiting {delay}ms before retry attempt {attempt + 1}");
+                    Task.Delay(delay).Wait();
+                }
+            }
         }
 
         public void Disconnect()
@@ -42,7 +73,53 @@ namespace MAF.Commerce.HardwareStation.Extension.NGenius.Services
             => Send($"startTransaction {payload.ToString(Newtonsoft.Json.Formatting.None)}");
 
         public JObject GetStatus()
-            => Parse(Send("getStatus()"));
+        {
+            for (int attempt = 1; attempt <= MaxRetryAttempts; attempt++)
+            {
+                try
+                {
+                    var response = Send("getStatus()");
+                    var parsed = Parse(response);
+                    
+                    // Check if response is empty or invalid
+                    if (parsed == null || !parsed.HasValues)
+                    {
+                        Log($"GetStatus returned empty response on attempt {attempt}");
+                        
+                        if (attempt < MaxRetryAttempts)
+                        {
+                            var delay = BaseBackoffDelayMs * attempt;
+                            Log($"Waiting {delay}ms before retrying GetStatus (attempt {attempt + 1})");
+                            Task.Delay(delay).Wait();
+                            continue;
+                        }
+                        else
+                        {
+                            Log("GetStatus failed after all retry attempts, returning empty JObject");
+                            return new JObject();
+                        }
+                    }
+                    
+                    return parsed;
+                }
+                catch (Exception ex)
+                {
+                    Log($"GetStatus failed on attempt {attempt}: {ex.Message}");
+                    
+                    if (attempt == MaxRetryAttempts)
+                    {
+                        Log("GetStatus failed after all retry attempts, returning empty JObject");
+                        return new JObject();
+                    }
+                    
+                    var delay = BaseBackoffDelayMs * attempt;
+                    Log($"Waiting {delay}ms before retrying GetStatus (attempt {attempt + 1})");
+                    Task.Delay(delay).Wait();
+                }
+            }
+            
+            return new JObject();
+        }
 
         public JObject GetResult(string sourceId)
             => Parse(Send($"getResult({sourceId})"));
@@ -65,17 +142,29 @@ namespace MAF.Commerce.HardwareStation.Extension.NGenius.Services
         {
             var start = DateTime.UtcNow;
             bool updateSent = false;
+            int consecutiveError110Count = 0;
+            
             while (DateTime.UtcNow - start < (updateSent ? TimeSpan.FromSeconds(150) : timeout))
             {
                 var status = GetStatus();
 
-                // Error 110: Terminal Busy
+                // Error 110: Terminal Busy - implement exponential backoff
                 if (status?["error"]?.ToString().Contains("Previous command still in progress") == true)
                 {
-                    Log($"PED busy (error 110), waiting for PED to be ready. SourceId: {sourceId}");
-                    await Task.Delay(poll);
+                    consecutiveError110Count++;
+                    var backoffDelay = Math.Min(
+                        BaseBackoffDelayMs * (int)Math.Pow(2, consecutiveError110Count - 1), 
+                        MaxBackoffDelayMs
+                    );
+                    
+                    Log($"PED busy (error 110), waiting {backoffDelay}ms for PED to be ready. SourceId: {sourceId}, consecutive count: {consecutiveError110Count}");
+                    await Task.Delay(backoffDelay);
                     continue;
                 }
+                
+                // Reset error 110 counter on successful response
+                consecutiveError110Count = 0;
+                
                 // Error 101: Command Timed Out
                 if (status?["error"]?.ToString().Contains("Command timed out") == true)
                 {
@@ -140,24 +229,62 @@ namespace MAF.Commerce.HardwareStation.Extension.NGenius.Services
 
         private string Send(string line)
         {
-            if (stream == null)
-                throw new InvalidOperationException("NGPAS stream not initialized. Call Connect() first.");
+            for (int attempt = 1; attempt <= MaxRetryAttempts; attempt++)
+            {
+                try
+                {
+                    // Check if connection is valid
+                    if (stream == null || tcp == null || !tcp.Connected)
+                    {
+                        Log($"Connection lost, attempting to reconnect (attempt {attempt})");
+                        Connect();
+                    }
 
-            Log($"SEND: {line}");
+                    Log($"SEND: {line}");
 
-            var outBytes = Encoding.UTF8.GetBytes(line + "\n");
-            stream.Write(outBytes, 0, outBytes.Length);
+                    var outBytes = Encoding.UTF8.GetBytes(line + "\n");
+                    stream.Write(outBytes, 0, outBytes.Length);
 
-            var buffer = new byte[16384];
-            var read = stream.Read(buffer, 0, buffer.Length);
-            var response = Encoding.UTF8.GetString(buffer, 0, read);
+                    var buffer = new byte[16384];
+                    var read = stream.Read(buffer, 0, buffer.Length);
+                    var response = Encoding.UTF8.GetString(buffer, 0, read);
 
-            Log($"RECV: {response}");
+                    Log($"RECV: {response}");
 
-            if (response.Contains("error"))
-                Log($"ERROR: {response}");
+                    if (response.Contains("error"))
+                        Log($"ERROR: {response}");
 
-            return response;
+                    return response;
+                }
+                catch (Exception ex) when (IsNetworkException(ex))
+                {
+                    Log($"Network error on attempt {attempt}: {ex.Message}");
+                    
+                    // Force disconnect to ensure clean state for reconnection
+                    Disconnect();
+                    
+                    if (attempt == MaxRetryAttempts)
+                    {
+                        Log($"Send failed after {MaxRetryAttempts} attempts");
+                        throw new InvalidOperationException($"NGPAS communication failed after {MaxRetryAttempts} attempts", ex);
+                    }
+                    
+                    // Wait before retry
+                    var delay = BaseBackoffDelayMs * attempt;
+                    Log($"Waiting {delay}ms before retry attempt {attempt + 1}");
+                    Task.Delay(delay).Wait();
+                }
+            }
+            
+            throw new InvalidOperationException("NGPAS communication failed - this should not be reached");
+        }
+        
+        private static bool IsNetworkException(Exception ex)
+        {
+            return ex is SocketException || 
+                   ex is System.IO.IOException ||
+                   ex is ObjectDisposedException ||
+                   ex is InvalidOperationException;
         }
 
         private static JObject Parse(string s)
@@ -234,11 +361,19 @@ namespace MAF.Commerce.HardwareStation.Extension.NGenius.Services
         /// </summary>
         public bool IsPedIdle()
         {
-            var status = GetStatus();
-            var displayText = status?["displayText"]?.Value<string>();
-            return status?["inProgress"]?.Value<bool>() == false
-                && status?["complete"]?.Value<bool>() == true
-                && (displayText?.Contains("NO TXN") == true || displayText?.Contains("SYSTEM IDLE") == true);
+            try
+            {
+                var status = GetStatus();
+                var displayText = status?["displayText"]?.Value<string>();
+                return status?["inProgress"]?.Value<bool>() == false
+                    && status?["complete"]?.Value<bool>() == true
+                    && (displayText?.Contains("NO TXN") == true || displayText?.Contains("SYSTEM IDLE") == true);
+            }
+            catch (Exception ex)
+            {
+                Log($"Error checking PED idle state: {ex.Message}");
+                return false; // Assume not idle on error
+            }
         }
     }
 }
